@@ -1,81 +1,122 @@
-"""Tile pinboard — bookmark important tiles."""
+"""Tile pinboard — bookmark pins, boards, categories, and collaborative curation."""
 import time
 from dataclasses import dataclass, field
+from typing import Optional
 from collections import defaultdict
 
 @dataclass
 class Pin:
     tile_id: str
-    category: str = "general"
+    pinned_by: str
+    board: str = "default"
     note: str = ""
-    pinned_by: str = ""
+    tags: list[str] = field(default_factory=list)
     pinned_at: float = field(default_factory=time.time)
-    expires_at: float = 0.0
-    weight: float = 1.0
+    weight: float = 1.0  # for sorting within board
+
+@dataclass
+class Board:
+    name: str
+    owner: str = ""
+    description: str = ""
+    is_public: bool = True
+    created_at: float = field(default_factory=time.time)
+    max_pins: int = 1000
 
 class TilePinboard:
-    def __init__(self, max_pins: int = 200, default_ttl: float = 0):
-        self.max_pins = max_pins
-        self.default_ttl = default_ttl
-        self._pins: dict[str, Pin] = {}
-        self._categories: dict[str, list[str]] = defaultdict(list)
+    def __init__(self):
+        self._pins: dict[str, list[Pin]] = defaultdict(list)  # board -> pins
+        self._boards: dict[str, Board] = {}
+        self._tile_pins: dict[str, list[Pin]] = defaultdict(list)  # tile_id -> pins
+        self._stats = {"total_pins": 0, "total_boards": 0}
 
-    def pin(self, tile_id: str, category: str = "general", note: str = "",
-            pinned_by: str = "", ttl: float = 0) -> Pin:
-        now = time.time()
-        pin = Pin(tile_id=tile_id, category=category, note=note,
-                  pinned_by=pinned_by, expires_at=now + ttl if ttl > 0 else 0)
-        if tile_id in self._pins:
-            old = self._pins[tile_id]
-            self._categories[old.category] = [t for t in self._categories[old.category] if t != tile_id]
-        self._pins[tile_id] = pin
-        self._categories[category].append(tile_id)
-        if len(self._pins) > self.max_pins:
-            self._evict_oldest()
+    def create_board(self, name: str, owner: str = "", description: str = "",
+                     is_public: bool = True, max_pins: int = 1000) -> Board:
+        board = Board(name=name, owner=owner, description=description,
+                     is_public=is_public, max_pins=max_pins)
+        self._boards[name] = board
+        self._stats["total_boards"] = len(self._boards)
+        return board
+
+    def pin(self, tile_id: str, pinned_by: str, board: str = "default",
+            note: str = "", tags: list[str] = None, weight: float = 1.0) -> Pin:
+        board_obj = self._boards.get(board)
+        if not board_obj:
+            board_obj = self.create_board(board)
+        if len(self._pins[board]) >= board_obj.max_pins:
+            raise ValueError(f"Board '{board}' is full ({board_obj.max_pins} pins)")
+        pin = Pin(tile_id=tile_id, pinned_by=pinned_by, board=board,
+                 note=note, tags=tags or [], weight=weight)
+        self._pins[board].append(pin)
+        self._tile_pins[tile_id].append(pin)
+        self._stats["total_pins"] += 1
         return pin
 
-    def unpin(self, tile_id: str) -> bool:
-        pin = self._pins.pop(tile_id, None)
-        if pin:
-            self._categories[pin.category] = [t for t in self._categories[pin.category] if t != tile_id]
-            return True
-        return False
+    def unpin(self, tile_id: str, board: str = "", pinned_by: str = "") -> int:
+        removed = 0
+        boards = {board} if board else set(self._pins.keys())
+        for b in boards:
+            before = len(self._pins[b])
+            self._pins[b] = [p for p in self._pins[b] if not (
+                p.tile_id == tile_id and (not pinned_by or p.pinned_by == pinned_by))]
+            removed += before - len(self._pins[b])
+        if removed:
+            self._tile_pins[tile_id] = [p for p in self._tile_pins.get(tile_id, [])
+                                        if not (not board or p.board == board)]
+        self._stats["total_pins"] = max(0, self._stats["total_pins"] - removed)
+        return removed
 
-    def is_pinned(self, tile_id: str) -> bool:
-        pin = self._pins.get(tile_id)
-        if not pin:
-            return False
-        if pin.expires_at > 0 and time.time() > pin.expires_at:
-            self.unpin(tile_id)
-            return False
-        return True
+    def get_board(self, name: str, sort_by: str = "weight", limit: int = 50) -> list[Pin]:
+        pins = list(self._pins.get(name, []))
+        if sort_by == "weight":
+            pins.sort(key=lambda p: p.weight, reverse=True)
+        elif sort_by == "recent":
+            pins.sort(key=lambda p: p.pinned_at, reverse=True)
+        elif sort_by == "note":
+            pins.sort(key=lambda p: p.note)
+        return pins[:limit]
 
-    def get_pin(self, tile_id: str) -> Pin:
-        return self._pins.get(tile_id)
+    def boards_for_tile(self, tile_id: str) -> list[str]:
+        return list(set(p.board for p in self._tile_pins.get(tile_id, [])))
 
-    def by_category(self, category: str) -> list[Pin]:
-        tile_ids = self._categories.get(category, [])
-        return [self._pins[tid] for tid in tile_ids if tid in self._pins and self.is_pinned(tid)]
-
-    def search(self, query: str) -> list[Pin]:
+    def search_pins(self, query: str, board: str = "") -> list[Pin]:
         q = query.lower()
-        return [p for p in self._pins.values()
-                if self.is_pinned(p.tile_id) and
-                (q in p.tile_id.lower() or q in p.note.lower() or q in p.category.lower())]
+        boards = {board} if board else set(self._pins.keys())
+        results = []
+        for b in boards:
+            for p in self._pins[b]:
+                if q in p.note.lower() or q in " ".join(p.tags).lower():
+                    results.append(p)
+        results.sort(key=lambda p: p.weight, reverse=True)
+        return results[:50]
 
-    def _evict_oldest(self):
-        valid = [(tid, p) for tid, p in self._pins.items() if self.is_pinned(tid)]
-        if valid:
-            valid.sort(key=lambda x: x[1].pinned_at)
-            self.unpin(valid[0][0])
+    def pins_by_agent(self, agent: str) -> list[Pin]:
+        results = []
+        for pins in self._pins.values():
+            results.extend(p for p in pins if p.pinned_by == agent)
+        results.sort(key=lambda p: p.pinned_at, reverse=True)
+        return results
 
-    def purge_expired(self) -> int:
-        expired = [tid for tid, p in self._pins.items() if p.expires_at > 0 and time.time() > p.expires_at]
-        for tid in expired:
-            self.unpin(tid)
-        return len(expired)
+    def merge_boards(self, source: str, target: str) -> int:
+        moved = 0
+        for pin in self._pins.get(source, []):
+            pin.board = target
+            self._pins[target].append(pin)
+            moved += 1
+        self._pins.pop(source, None)
+        self._boards.pop(source, None)
+        return moved
+
+    def board_stats(self, name: str) -> dict:
+        pins = self._pins.get(name, [])
+        agents = set(p.pinned_by for p in pins)
+        tags = set()
+        for p in pins:
+            tags.update(p.tags)
+        return {"board": name, "pins": len(pins), "unique_agents": len(agents),
+                "tags": list(tags), "avg_weight": round(sum(p.weight for p in pins) / max(len(pins), 1), 2)}
 
     @property
     def stats(self) -> dict:
-        cats = {k: len(v) for k, v in self._categories.items() if v}
-        return {"total_pins": len(self._pins), "categories": cats, "max_pins": self.max_pins}
+        return {**self._stats, "boards": len(self._boards),
+                "tiles_pinned": len(self._tile_pins)}
